@@ -1,0 +1,7 @@
+numpy
+pandas
+requests
+tqdm
+pyarrow
+matplotlib
+jupyter
