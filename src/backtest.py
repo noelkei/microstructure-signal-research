@@ -16,6 +16,8 @@ class BacktestConfig:
     # prices
     exec_price_col: str = "open"      # execution at bar open
     monitor_price_col: str = "close"  # monitor take-profit on bar close
+
+    # signal + gating columns
     signal_col: str = "z_svi_60_600_lag1"
     intensity_col: str = "intensity_60"
 
@@ -71,8 +73,16 @@ def split_by_time(df: pd.DataFrame, fracs: List[float]) -> Dict[str, pd.DataFram
 # Costs
 # ----------------------------
 def compute_cost_per_trade(cfg: BacktestConfig) -> float:
-    # round-trip cost in return space
     return 2.0 * (cfg.fee_bps + cfg.slippage_bps) / 1e4
+
+
+# ----------------------------
+# Column checks
+# ----------------------------
+def _require_columns(df: pd.DataFrame, cols: List[str], name: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{name} missing required columns: {missing}")
 
 
 # ----------------------------
@@ -105,37 +115,26 @@ def simulate_non_overlapping_trades(
     df: pd.DataFrame,
     H: int,
     q: float,
-    pt_bps: float,              # take-profit in bps (0 disables)
+    pt_bps: float,
     cfg: BacktestConfig,
     intensity_low: float = -np.inf,
     intensity_high: float = np.inf,
 ) -> pd.DataFrame:
-    """
-    Non-overlapping trades, max holding H seconds, optional take-profit.
-
-    Decision at time t (signal at t).
-    Entry at (t+1) open.
-
-    Time exit: at (entry_time + H) open.
-
-    Take-profit exit (discrete + conservative):
-      - monitor unrealized return using close at times:
-          entry_time, entry_time+1, ..., entry_time+H-1
-      - if threshold crossed at close(time u), exit at open(u+1)
-      - ensures we do NOT "decide and fill" at the same open price.
-
-    pt_bps = 0 -> disabled (pure time exit).
-    """
     if not isinstance(df.index, pd.DatetimeIndex):
         raise RuntimeError("df index must be DatetimeIndex.")
     if df.index.tz is None:
         raise RuntimeError("df index must be timezone-aware (UTC).")
 
-    cost = compute_cost_per_trade(cfg)
-    pt = float(pt_bps) / 1e4  # convert bps -> return threshold
+    req = [cfg.exec_price_col, cfg.monitor_price_col, cfg.signal_col]
+    if cfg.use_intensity_gate:
+        req.append(cfg.intensity_col)
+    _require_columns(df, req, "features dataframe")
 
-    exec_px = df[cfg.exec_price_col]       # open
-    mon_px = df[cfg.monitor_price_col]     # close
+    cost = compute_cost_per_trade(cfg)
+    pt = float(pt_bps) / 1e4
+
+    exec_px = df[cfg.exec_price_col]
+    mon_px = df[cfg.monitor_price_col]
     signal = df[cfg.signal_col]
     intensity = df[cfg.intensity_col] if cfg.use_intensity_gate else None
 
@@ -175,14 +174,10 @@ def simulate_non_overlapping_trades(
         if not np.isfinite(entry_px) or entry_px <= 0:
             continue
 
-        # default: time exit
         exit_time = max_exit_time
         exit_reason = "time"
 
-        # optional take-profit
         if pt > 0:
-            # We monitor at closes from entry_time .. entry_time+H-1
-            # If crossed at close(check_time), we exit next second open.
             for k in range(H):
                 check_time = entry_time + pd.Timedelta(seconds=k)
                 exit_candidate = check_time + one_sec
@@ -205,7 +200,6 @@ def simulate_non_overlapping_trades(
 
         gross_ret = side * (exit_px / entry_px - 1.0)
         pnl = gross_ret - cost
-
         hold_seconds = int((exit_time - entry_time) / one_sec)
 
         trades.append(
@@ -228,7 +222,6 @@ def simulate_non_overlapping_trades(
             }
         )
 
-        # non-overlapping: next decision after the exit second
         next_allowed_t = exit_time + one_sec
 
     return pd.DataFrame(trades)
@@ -299,20 +292,13 @@ def summarize_trades(trades: pd.DataFrame) -> Dict[str, float]:
 # Baseline Monte Carlo (supports take-profit logic)
 # ----------------------------
 def random_sign_baseline_mc(
-    df_prices: pd.DataFrame,      # needs open+close columns
+    df_prices: pd.DataFrame,
     trades: pd.DataFrame,
     H: int,
     pt_bps: float,
     cfg: BacktestConfig,
     n_trials: int = 500,
 ) -> Dict[str, float]:
-    """
-    Baseline: keep SAME entry times, randomize side (+1/-1), and apply the same exit policy:
-      - time exit at entry+H open
-      - optional take-profit triggered on close, exit next open
-
-    This is more coherent than keeping the original exit_time when exits are side-dependent.
-    """
     if trades.empty:
         return {
             "baseline_trials": int(n_trials),
@@ -327,6 +313,8 @@ def random_sign_baseline_mc(
             "baseline_sharpe_p95": np.nan,
         }
 
+    _require_columns(df_prices, [cfg.exec_price_col, cfg.monitor_price_col], "df_prices")
+
     rng = np.random.default_rng(cfg.seed)
     cost = compute_cost_per_trade(cfg)
     pt = float(pt_bps) / 1e4
@@ -339,10 +327,6 @@ def random_sign_baseline_mc(
     entries = pd.to_datetime(trades["entry_time"]).to_list()
     n = len(entries)
 
-    # Precompute trigger returns (close) and fill returns (open at next second)
-    # For each trade i, for k=0..H-1:
-    #   trigger_ret[i,k] = close(entry+k)/entry_open - 1
-    #   fill_ret[i,k]    = open(entry+k+1)/entry_open - 1   (exit at next open)
     trigger_ret = np.empty((n, H), dtype="float64")
     fill_ret = np.empty((n, H), dtype="float64")
 
@@ -361,14 +345,13 @@ def random_sign_baseline_mc(
     for j in range(n_trials):
         side = rng.choice([-1.0, 1.0], size=n)
 
-        # determine exit index per trade
         if pt <= 0:
             idx = np.full(n, H - 1, dtype=int)
         else:
             signed_trigger = side[:, None] * trigger_ret
             hit = signed_trigger >= pt
             any_hit = hit.any(axis=1)
-            first = hit.argmax(axis=1)  # returns 0 if all False, so fix with any_hit
+            first = hit.argmax(axis=1)
             idx = np.where(any_hit, first, H - 1)
 
         gross = side * fill_ret[np.arange(n), idx]
@@ -383,20 +366,20 @@ def random_sign_baseline_mc(
         std = float(np.std(pnl, ddof=1)) if n > 1 else 0.0
         sharpes[j] = (avg / std * np.sqrt(n)) if (std > 0 and n > 1) else np.nan
 
-    def q(x, p):
+    def qnt(x, p):
         return float(np.nanquantile(x, p))
 
     return {
         "baseline_trials": int(n_trials),
         "baseline_avg_pnl_mean": float(np.nanmean(avg_pnls)),
-        "baseline_avg_pnl_p05": q(avg_pnls, 0.05),
-        "baseline_avg_pnl_p95": q(avg_pnls, 0.95),
+        "baseline_avg_pnl_p05": qnt(avg_pnls, 0.05),
+        "baseline_avg_pnl_p95": qnt(avg_pnls, 0.95),
         "baseline_total_return_mean": float(np.nanmean(total_returns)),
-        "baseline_total_return_p05": q(total_returns, 0.05),
-        "baseline_total_return_p95": q(total_returns, 0.95),
+        "baseline_total_return_p05": qnt(total_returns, 0.05),
+        "baseline_total_return_p95": qnt(total_returns, 0.95),
         "baseline_sharpe_mean": float(np.nanmean(sharpes)),
-        "baseline_sharpe_p05": q(sharpes, 0.05),
-        "baseline_sharpe_p95": q(sharpes, 0.95),
+        "baseline_sharpe_p05": qnt(sharpes, 0.05),
+        "baseline_sharpe_p95": qnt(sharpes, 0.95),
     }
 
 
@@ -417,8 +400,13 @@ def grid_search(
         for q in q_list:
             for pt_bps in pt_bps_list:
                 trades = simulate_non_overlapping_trades(
-                    tune_df, H=H, q=q, pt_bps=pt_bps, cfg=cfg,
-                    intensity_low=intensity_low, intensity_high=intensity_high
+                    tune_df,
+                    H=H,
+                    q=q,
+                    pt_bps=pt_bps,
+                    cfg=cfg,
+                    intensity_low=intensity_low,
+                    intensity_high=intensity_high,
                 )
                 summ = summarize_trades(trades)
                 rows.append({"H": H, "q": q, "pt_bps": float(pt_bps), **summ})
@@ -426,23 +414,15 @@ def grid_search(
 
 
 def pick_best_params_per_H(grid: pd.DataFrame, cfg: BacktestConfig) -> Dict[int, Tuple[float, float]]:
-    """
-    Choose (q, pt_bps) per H based on tune Sharpe, with minimum trade constraint.
-    Tie-breakers: higher sharpe, higher n_trades, smaller pt_bps (simpler).
-    """
     best: Dict[int, Tuple[float, float]] = {}
     for H, g in grid.groupby("H"):
         g2 = g[g["n_trades"] >= cfg.min_trades_tune].copy()
         if g2.empty:
-            # fallback: smallest q, pt=0 if available else smallest pt
             g0 = g.sort_values(["q", "pt_bps"]).iloc[0]
             best[int(H)] = (float(g0["q"]), float(g0["pt_bps"]))
             continue
 
-        g2 = g2.sort_values(
-            ["sharpe_trades", "n_trades", "pt_bps"],
-            ascending=[False, False, True],
-        )
+        g2 = g2.sort_values(["sharpe_trades", "n_trades", "pt_bps"], ascending=[False, False, True])
         row = g2.iloc[0]
         best[int(H)] = (float(row["q"]), float(row["pt_bps"]))
     return best
@@ -456,28 +436,23 @@ def main():
     ap.add_argument("--features", default="data/processed/features_1s.parquet")
     ap.add_argument("--out_dir", default="reports/tables")
 
-    # Split control
     ap.add_argument("--split", type=str, default="0.6,0.2,0.2")
 
-    # Grid
     ap.add_argument("--H_list", type=str, default="10,30,60")
     ap.add_argument("--q_list", type=str, default="1.0,1.5,2.0")
-    ap.add_argument("--pt_bps_list", type=str, default="0", help="Take-profit candidates in bps, e.g. '0,5,10,20' (0 disables)")
+    ap.add_argument("--pt_bps_list", type=str, default="0", help="Take-profit candidates in bps, e.g. '0,5,10,20'")
 
-    # Costs
     ap.add_argument("--fee_bps", type=float, default=10.0)
     ap.add_argument("--slippage_bps", type=float, default=5.0)
 
-    # Signal + gating
     ap.add_argument("--signal_col", type=str, default="z_svi_60_600_lag1")
     ap.add_argument("--use_intensity_gate", action="store_true")
+    ap.add_argument("--intensity_col", type=str, default="intensity_60")
     ap.add_argument("--intensity_q_low", type=float, default=0.5)
     ap.add_argument("--intensity_q_high", type=float, default=None)
 
-    # Baseline MC
     ap.add_argument("--baseline_trials", type=int, default=500)
 
-    # Misc
     ap.add_argument("--min_trades_tune", type=int, default=30)
     ap.add_argument("--seed", type=int, default=7)
 
@@ -488,6 +463,7 @@ def main():
         slippage_bps=float(args.slippage_bps),
         signal_col=str(args.signal_col),
         use_intensity_gate=bool(args.use_intensity_gate),
+        intensity_col=str(args.intensity_col),
         intensity_q_low=float(args.intensity_q_low),
         intensity_q_high=None if args.intensity_q_high is None else float(args.intensity_q_high),
         min_trades_tune=int(args.min_trades_tune),
@@ -503,6 +479,11 @@ def main():
     if df.index.tz is None:
         raise RuntimeError("features index must be timezone-aware (UTC).")
 
+    base_req = [cfg.exec_price_col, cfg.monitor_price_col, cfg.signal_col]
+    if cfg.use_intensity_gate:
+        base_req.append(cfg.intensity_col)
+    _require_columns(df, base_req, "features dataframe")
+
     fracs = parse_split(args.split)
     splits = split_by_time(df, fracs)
 
@@ -510,28 +491,22 @@ def main():
     val_df = splits.get("val")
     test_df = splits["test"]
 
-    # Parse lists
     H_list = [int(x.strip()) for x in args.H_list.split(",") if x.strip()]
     q_list = [float(x.strip()) for x in args.q_list.split(",") if x.strip()]
     pt_bps_list = [float(x.strip()) for x in args.pt_bps_list.split(",") if x.strip()]
 
-    # Compute gating bounds ONLY on TRAIN
     intensity_low, intensity_high = pick_intensity_bounds(train_df, cfg)
 
-    # Tune set = VAL if provided, else TRAIN
     tune_df = val_df if val_df is not None else train_df
     tune_name = "val" if val_df is not None else "train"
 
-    # 1) Grid on tune set
     grid = grid_search(tune_df, H_list, q_list, pt_bps_list, cfg, intensity_low, intensity_high)
     grid_path = os.path.join(args.out_dir, f"grid_tune_{tune_name}.csv")
     grid.to_csv(grid_path, index=False)
     print(f"[OK] Saved tuning grid ({tune_name}) -> {grid_path}")
 
-    # 2) Pick best (q, pt_bps) per H
     best_params = pick_best_params_per_H(grid, cfg)
 
-    # 3) Evaluate on TEST once
     oos_rows = []
     for H in H_list:
         q, pt_bps = best_params[int(H)]
@@ -554,7 +529,9 @@ def main():
             "q_chosen_tune": float(q),
             "pt_bps_chosen_tune": float(pt_bps),
             "tune_set": tune_name,
+            "signal_col": cfg.signal_col,
             "intensity_gate": bool(cfg.use_intensity_gate),
+            "intensity_col": cfg.intensity_col if cfg.use_intensity_gate else "",
             "intensity_low": float(intensity_low),
             "intensity_high": float(intensity_high) if np.isfinite(intensity_high) else np.inf,
             **summ,
@@ -571,7 +548,6 @@ def main():
     oos_res.to_csv(oos_path, index=False)
     print(f"[OK] Saved TEST summary -> {oos_path}")
 
-    # Save config
     cfg_path = os.path.join(args.out_dir, "config.json")
     payload = {
         "cfg": asdict(cfg),
