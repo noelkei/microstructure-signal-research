@@ -5,7 +5,7 @@ import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -31,89 +31,102 @@ def feature_provenance(W: int, L: int, eps: float) -> Dict[str, FeatureSpec]:
         ),
         f"rv_{W}": FeatureSpec(
             name=f"rv_{W}",
-            definition=f"Realized vol proxy over last {W}s: std(r1 over window W)",
+            definition=f"Realized volatility proxy: rv_W(t) = std(r1 over last {W}s)",
             inputs=["r1"],
             params={"W": W},
             causal=True,
         ),
         f"intensity_{W}": FeatureSpec(
             name=f"intensity_{W}",
-            definition=f"Trade intensity over last {W}s using kline n_trades: sum(n_trades over window W)",
+            definition=f"Trade intensity from klines: sum(n_trades over last {W}s)",
             inputs=["n_trades"],
             params={"W": W},
             causal=True,
         ),
         "tbr": FeatureSpec(
             name="tbr",
-            definition=f"Taker-buy ratio: tbr(t) = taker_buy_base_t / max(volume_t, eps), eps={eps}",
+            definition=f"Taker-buy ratio (klines): taker_buy_base / max(volume, eps), eps={eps}",
             inputs=["taker_buy_base", "volume"],
             params={"eps": eps},
             causal=True,
         ),
         "sv": FeatureSpec(
             name="sv",
-            definition="Signed volume proxy: sv(t) = (2*tbr(t) - 1) * volume_t",
+            definition="Signed volume proxy (klines): sv = (2*tbr - 1) * volume",
             inputs=["tbr", "volume"],
             params={},
             causal=True,
         ),
         f"svi_{W}": FeatureSpec(
             name=f"svi_{W}",
-            definition=f"Rolling signed volume imbalance: svi_W(t) = sum(sv over last {W}s)",
+            definition=f"Rolling signed volume imbalance (klines): sum(sv over last {W}s)",
             inputs=["sv"],
             params={"W": W},
             causal=True,
         ),
         f"z_svi_{W}_{L}": FeatureSpec(
             name=f"z_svi_{W}_{L}",
-            definition=f"Z-scored svi_W using last {L}s: (svi_W - mean_L) / std_L",
+            definition=f"Z-score of svi_{W} using last {L}s: (svi_W - mean_L)/std_L",
             inputs=[f"svi_{W}"],
             params={"W": W, "L": L},
             causal=True,
         ),
         f"z_svi_{W}_{L}_lag1": FeatureSpec(
             name=f"z_svi_{W}_{L}_lag1",
-            definition="Lagged z_svi by 1 second to avoid same-second execution assumptions.",
+            definition="Lagged z_svi by 1 second for conservative execution assumptions.",
             inputs=[f"z_svi_{W}_{L}"],
             params={"lag": 1},
             causal=True,
         ),
-        "ofi_1s": FeatureSpec(
-            name="ofi_1s",
-            definition="Order-flow imbalance proxy from aggTrades: ofi_1s(t) = buy_qty_1s(t) - sell_qty_1s(t)",
-            inputs=["buy_qty_1s", "sell_qty_1s"],
+        "ofi_base_1s": FeatureSpec(
+            name="ofi_base_1s",
+            definition="OFI proxy from aggTrades in base units: ofi_base_1s = taker_buy_base_1s - taker_sell_base_1s",
+            inputs=["taker_buy_base_1s", "taker_sell_base_1s"],
             params={},
+            causal=True,
+        ),
+        "ofi_ratio_1s": FeatureSpec(
+            name="ofi_ratio_1s",
+            definition=f"Normalized OFI proxy: ofi_base_1s / max(base_qty_1s, eps), eps={eps}",
+            inputs=["ofi_base_1s", "base_qty_1s"],
+            params={"eps": eps},
             causal=True,
         ),
         f"ofi_{W}": FeatureSpec(
             name=f"ofi_{W}",
-            definition=f"Rolling OFI over last {W}s: sum(ofi_1s over window W)",
-            inputs=["ofi_1s"],
+            definition=f"Rolling OFI proxy over last {W}s: sum(ofi_base_1s over window W)",
+            inputs=["ofi_base_1s"],
             params={"W": W},
             causal=True,
         ),
         f"z_ofi_{W}_{L}": FeatureSpec(
             name=f"z_ofi_{W}_{L}",
-            definition=f"Z-scored ofi_W using last {L}s: (ofi_W - mean_L) / std_L",
+            definition=f"Z-score of ofi_{W} using last {L}s: (ofi_W - mean_L)/std_L",
             inputs=[f"ofi_{W}"],
             params={"W": W, "L": L},
             causal=True,
         ),
         f"z_ofi_{W}_{L}_lag1": FeatureSpec(
             name=f"z_ofi_{W}_{L}_lag1",
-            definition="Lagged z_ofi by 1 second to avoid same-second execution assumptions.",
+            definition="Lagged z_ofi by 1 second for conservative execution assumptions.",
             inputs=[f"z_ofi_{W}_{L}"],
             params={"lag": 1},
             causal=True,
         ),
-        f"intensity_agg_{W}": FeatureSpec(
-            name=f"intensity_agg_{W}",
-            definition=f"AggTrades intensity over last {W}s: sum(n_aggs_1s over window W)",
-            inputs=["n_aggs_1s"],
+        f"intensity_trades_{W}": FeatureSpec(
+            name=f"intensity_trades_{W}",
+            definition=f"Trade intensity from aggTrades: sum(n_aggtrades_1s over last {W}s)",
+            inputs=["n_aggtrades_1s"],
             params={"W": W},
             causal=True,
         ),
     }
+
+
+def _assert_has_columns(df: pd.DataFrame, cols: List[str], name: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{name} missing required columns: {missing}")
 
 
 def compute_features(
@@ -125,6 +138,11 @@ def compute_features(
 ) -> pd.DataFrame:
     df = bars.copy()
 
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise RuntimeError("bars must have a DateTimeIndex.")
+    if df.index.tz is None:
+        raise RuntimeError("bars index must be timezone-aware (UTC).")
+
     if trades_1s is not None:
         t = trades_1s.copy()
         if not isinstance(t.index, pd.DatetimeIndex):
@@ -132,23 +150,30 @@ def compute_features(
         if t.index.tz is None:
             raise RuntimeError("trades_1s index must be timezone-aware (UTC).")
 
+        required_trade_cols = [
+            "base_qty_1s",
+            "taker_buy_base_1s",
+            "taker_sell_base_1s",
+            "n_aggtrades_1s",
+        ]
+        _assert_has_columns(t, required_trade_cols, "trades_1s")
+
         df = df.join(t, how="left")
 
-        trade_cols_float = ["buy_qty_1s", "sell_qty_1s", "qty_1s", "ofi_1s"]
-        for c in trade_cols_float:
-            if c in df.columns:
-                df[c] = df[c].fillna(0.0).astype("float64")
+        for c in ["base_qty_1s", "taker_buy_base_1s", "taker_sell_base_1s"]:
+            df[c] = df[c].fillna(0.0).astype("float64")
 
-        trade_cols_int = ["n_aggs_1s", "buy_count_1s", "sell_count_1s", "ofi_count_1s"]
-        for c in trade_cols_int:
-            if c in df.columns:
-                df[c] = df[c].fillna(0).astype("int64")
+        df["n_aggtrades_1s"] = df["n_aggtrades_1s"].fillna(0).astype("int64")
 
         if "is_imputed_trades" in df.columns:
             df["is_imputed_trades"] = df["is_imputed_trades"].fillna(True).astype("bool")
 
-        if "ofi_1s" not in df.columns and ("buy_qty_1s" in df.columns and "sell_qty_1s" in df.columns):
-            df["ofi_1s"] = df["buy_qty_1s"] - df["sell_qty_1s"]
+        if "ofi_base_1s" not in df.columns:
+            df["ofi_base_1s"] = df["taker_buy_base_1s"] - df["taker_sell_base_1s"]
+        df["ofi_base_1s"] = df["ofi_base_1s"].fillna(0.0).astype("float64")
+
+        denom_trade = np.maximum(df["base_qty_1s"].to_numpy(dtype="float64"), eps)
+        df["ofi_ratio_1s"] = df["ofi_base_1s"].to_numpy(dtype="float64") / denom_trade
 
     log_close = np.log(df["close"].astype("float64"))
     df["r1"] = log_close.diff()
@@ -160,7 +185,7 @@ def compute_features(
     denom = np.maximum(df["volume"].to_numpy(dtype="float64"), eps)
     df["tbr"] = df["taker_buy_base"].to_numpy(dtype="float64") / denom
 
-    df["sv"] = (2.0 * df["tbr"] - 1.0) * df["volume"]
+    df["sv"] = (2.0 * df["tbr"] - 1.0) * df["volume"].astype("float64")
 
     df[f"svi_{W}"] = df["sv"].rolling(window=W, min_periods=W).sum()
 
@@ -172,9 +197,9 @@ def compute_features(
     df[z_svi] = (df[svi_col] - mean_L) / std_L
     df[f"{z_svi}_lag1"] = df[z_svi].shift(1)
 
-    if trades_1s is not None and "ofi_1s" in df.columns:
+    if trades_1s is not None:
         ofiW = f"ofi_{W}"
-        df[ofiW] = df["ofi_1s"].rolling(window=W, min_periods=W).sum()
+        df[ofiW] = df["ofi_base_1s"].rolling(window=W, min_periods=W).sum()
 
         mean_L_ofi = df[ofiW].rolling(window=L, min_periods=L).mean()
         std_L_ofi = df[ofiW].rolling(window=L, min_periods=L).std()
@@ -183,8 +208,7 @@ def compute_features(
         df[z_ofi] = (df[ofiW] - mean_L_ofi) / std_L_ofi
         df[f"{z_ofi}_lag1"] = df[z_ofi].shift(1)
 
-        if "n_aggs_1s" in df.columns:
-            df[f"intensity_agg_{W}"] = df["n_aggs_1s"].rolling(window=W, min_periods=W).sum()
+        df[f"intensity_trades_{W}"] = df["n_aggtrades_1s"].rolling(window=W, min_periods=W).sum()
 
     return df
 
@@ -205,7 +229,6 @@ def main():
         raise ValueError("Require L > W for stable z-scoring (e.g., W=60, L=600).")
 
     bars = pd.read_parquet(args.bars)
-
     if not isinstance(bars.index, pd.DatetimeIndex):
         raise RuntimeError("bars must have a DateTimeIndex.")
     if bars.index.tz is None:
