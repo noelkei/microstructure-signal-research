@@ -120,6 +120,83 @@ def feature_provenance(W: int, L: int, eps: float) -> Dict[str, FeatureSpec]:
             params={"W": W},
             causal=True,
         ),
+        "cfi_1s": FeatureSpec(
+            name="cfi_1s",
+            definition="Count flow imbalance from aggTrades: cfi_1s = buy_count_1s - sell_count_1s",
+            inputs=["buy_count_1s", "sell_count_1s"],
+            params={},
+            causal=True,
+        ),
+        "cfi_ratio_1s": FeatureSpec(
+            name="cfi_ratio_1s",
+            definition=f"Normalized count flow: cfi_ratio_1s = cfi_1s / max(n_aggtrades_1s, eps), eps={eps}",
+            inputs=["cfi_1s", "n_aggtrades_1s"],
+            params={"eps": eps},
+            causal=True,
+        ),
+        f"cfi_{W}": FeatureSpec(
+            name=f"cfi_{W}",
+            definition=f"Rolling count flow imbalance over last {W}s: sum(cfi_1s over window W)",
+            inputs=["cfi_1s"],
+            params={"W": W},
+            causal=True,
+        ),
+        f"z_cfi_{W}_{L}": FeatureSpec(
+            name=f"z_cfi_{W}_{L}",
+            definition=f"Z-score of cfi_{W} using last {L}s: (cfi_W - mean_L)/std_L",
+            inputs=[f"cfi_{W}"],
+            params={"W": W, "L": L},
+            causal=True,
+        ),
+        f"z_cfi_{W}_{L}_lag1": FeatureSpec(
+            name=f"z_cfi_{W}_{L}_lag1",
+            definition="Lagged z_cfi by 1 second for conservative execution assumptions.",
+            inputs=[f"z_cfi_{W}_{L}"],
+            params={"lag": 1},
+            causal=True,
+        ),
+        f"cfi_ratio_{W}": FeatureSpec(
+            name=f"cfi_ratio_{W}",
+            definition=f"Rolling normalized count flow over last {W}s: sum(cfi_ratio_1s over window W)",
+            inputs=["cfi_ratio_1s"],
+            params={"W": W},
+            causal=True,
+        ),
+        f"z_cfi_ratio_{W}_{L}": FeatureSpec(
+            name=f"z_cfi_ratio_{W}_{L}",
+            definition=f"Z-score of cfi_ratio_{W} using last {L}s: (cfi_ratio_W - mean_L)/std_L",
+            inputs=[f"cfi_ratio_{W}"],
+            params={"W": W, "L": L},
+            causal=True,
+        ),
+        f"z_cfi_ratio_{W}_{L}_lag1": FeatureSpec(
+            name=f"z_cfi_ratio_{W}_{L}_lag1",
+            definition="Lagged z_cfi_ratio by 1 second for conservative execution assumptions.",
+            inputs=[f"z_cfi_ratio_{W}_{L}"],
+            params={"lag": 1},
+            causal=True,
+        ),
+        "max_share_1s": FeatureSpec(
+            name="max_share_1s",
+            definition="Trade size concentration from aggTrades: max_qty_1s / max(base_qty_1s, eps)",
+            inputs=["max_qty_1s", "base_qty_1s"],
+            params={"eps": eps},
+            causal=True,
+        ),
+        f"z_max_share_{W}_{L}": FeatureSpec(
+            name=f"z_max_share_{W}_{L}",
+            definition=f"Z-score of rolling mean(max_share_1s, W) using last {L}s: (ms_roll - mean_L)/std_L",
+            inputs=["max_share_1s"],
+            params={"W": W, "L": L},
+            causal=True,
+        ),
+        f"z_max_share_{W}_{L}_lag1": FeatureSpec(
+            name=f"z_max_share_{W}_{L}_lag1",
+            definition="Lagged z_max_share by 1 second for conservative execution assumptions.",
+            inputs=[f"z_max_share_{W}_{L}"],
+            params={"lag": 1},
+            causal=True,
+        ),
     }
 
 
@@ -151,29 +228,54 @@ def compute_features(
             raise RuntimeError("trades_1s index must be timezone-aware (UTC).")
 
         required_trade_cols = [
+            "n_aggtrades_1s",
             "base_qty_1s",
+            "quote_qty_1s",
             "taker_buy_base_1s",
             "taker_sell_base_1s",
-            "n_aggtrades_1s",
+            "ofi_base_1s",
+            "ofi_ratio_1s",
         ]
         _assert_has_columns(t, required_trade_cols, "trades_1s")
 
         df = df.join(t, how="left")
 
-        for c in ["base_qty_1s", "taker_buy_base_1s", "taker_sell_base_1s"]:
-            df[c] = df[c].fillna(0.0).astype("float64")
+        float_cols = [
+            "base_qty_1s",
+            "quote_qty_1s",
+            "taker_buy_base_1s",
+            "taker_sell_base_1s",
+            "ofi_base_1s",
+            "ofi_ratio_1s",
+            "max_qty_1s",
+            "mean_qty_1s",
+            "max_share_1s",
+        ]
+        for c in float_cols:
+            if c in df.columns:
+                df[c] = df[c].fillna(0.0).astype("float64")
 
-        df["n_aggtrades_1s"] = df["n_aggtrades_1s"].fillna(0).astype("int64")
+        int_cols = [
+            "n_aggtrades_1s",
+            "buy_count_1s",
+            "sell_count_1s",
+            "ofi_count_1s",
+        ]
+        for c in int_cols:
+            if c in df.columns:
+                df[c] = df[c].fillna(0).astype("int64")
 
         if "is_imputed_trades" in df.columns:
             df["is_imputed_trades"] = df["is_imputed_trades"].fillna(True).astype("bool")
 
-        if "ofi_base_1s" not in df.columns:
+        if "ofi_base_1s" not in df.columns and ("taker_buy_base_1s" in df.columns and "taker_sell_base_1s" in df.columns):
             df["ofi_base_1s"] = df["taker_buy_base_1s"] - df["taker_sell_base_1s"]
-        df["ofi_base_1s"] = df["ofi_base_1s"].fillna(0.0).astype("float64")
+            df["ofi_base_1s"] = df["ofi_base_1s"].fillna(0.0).astype("float64")
 
-        denom_trade = np.maximum(df["base_qty_1s"].to_numpy(dtype="float64"), eps)
-        df["ofi_ratio_1s"] = df["ofi_base_1s"].to_numpy(dtype="float64") / denom_trade
+        if "ofi_ratio_1s" not in df.columns and "base_qty_1s" in df.columns and "ofi_base_1s" in df.columns:
+            denom_trade = np.maximum(df["base_qty_1s"].to_numpy(dtype="float64"), eps)
+            df["ofi_ratio_1s"] = df["ofi_base_1s"].to_numpy(dtype="float64") / denom_trade
+            df["ofi_ratio_1s"] = df["ofi_ratio_1s"].astype("float64")
 
     log_close = np.log(df["close"].astype("float64"))
     df["r1"] = log_close.diff()
@@ -209,6 +311,39 @@ def compute_features(
         df[f"{z_ofi}_lag1"] = df[z_ofi].shift(1)
 
         df[f"intensity_trades_{W}"] = df["n_aggtrades_1s"].rolling(window=W, min_periods=W).sum()
+
+        if "buy_count_1s" in df.columns and "sell_count_1s" in df.columns:
+            df["cfi_1s"] = df["buy_count_1s"].astype("float64") - df["sell_count_1s"].astype("float64")
+            df["cfi_ratio_1s"] = df["cfi_1s"] / np.maximum(df["n_aggtrades_1s"].to_numpy(dtype="float64"), eps)
+
+            cfiW = f"cfi_{W}"
+            df[cfiW] = df["cfi_1s"].rolling(window=W, min_periods=W).sum()
+
+            mean_L_cfi = df[cfiW].rolling(window=L, min_periods=L).mean()
+            std_L_cfi = df[cfiW].rolling(window=L, min_periods=L).std()
+
+            z_cfi = f"z_cfi_{W}_{L}"
+            df[z_cfi] = (df[cfiW] - mean_L_cfi) / std_L_cfi
+            df[f"{z_cfi}_lag1"] = df[z_cfi].shift(1)
+
+            cfirW = f"cfi_ratio_{W}"
+            df[cfirW] = df["cfi_ratio_1s"].rolling(window=W, min_periods=W).sum()
+
+            mean_L_cfir = df[cfirW].rolling(window=L, min_periods=L).mean()
+            std_L_cfir = df[cfirW].rolling(window=L, min_periods=L).std()
+
+            z_cfir = f"z_cfi_ratio_{W}_{L}"
+            df[z_cfir] = (df[cfirW] - mean_L_cfir) / std_L_cfir
+            df[f"{z_cfir}_lag1"] = df[z_cfir].shift(1)
+
+        if "max_share_1s" in df.columns:
+            ms_roll = df["max_share_1s"].rolling(window=W, min_periods=W).mean()
+            mean_L_ms = ms_roll.rolling(window=L, min_periods=L).mean()
+            std_L_ms = ms_roll.rolling(window=L, min_periods=L).std()
+
+            z_ms = f"z_max_share_{W}_{L}"
+            df[z_ms] = (ms_roll - mean_L_ms) / std_L_ms
+            df[f"{z_ms}_lag1"] = df[z_ms].shift(1)
 
     return df
 
